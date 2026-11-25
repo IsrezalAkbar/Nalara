@@ -53,3 +53,6 @@ firebase-tests/node_modules/
 
 # Dokumentasi Firebase
 DOKUMENTASI_PERUBAHAN_FIREBASE.md
+
+# Google Services configuration
+google-services.json
