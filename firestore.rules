@@ -1,0 +1,148 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function nonnegative(value) { return value is int && value >= 0; }
+    match /users/{uid} {
+      allow read: if owner(uid);
+      allow create, update: if owner(uid)
+        && request.resource.data.keys().hasOnly(['name', 'email', 'storeName', 'category', 'address', 'phone', 'notifications', 'paymentMethods', 'updatedAt'])
+        && request.resource.data.get('email', '') is string
+        && (!('email' in request.resource.data)
+          || request.resource.data.email == request.auth.token.get('email', ''))
+        && request.resource.data.get('name', '') is string
+        && request.resource.data.get('storeName', '') is string
+        && request.resource.data.get('category', '') is string
+        && request.resource.data.get('address', '') is string
+        && request.resource.data.get('phone', '') is string
+        && request.resource.data.get('notifications', false) is bool
+        && request.resource.data.get('paymentMethods', {'Tunai': true}) is map
+        && request.resource.data.get('paymentMethods', {'Tunai': true}).keys().hasOnly(['Tunai', 'QRIS'])
+        && request.resource.data.get('paymentMethods', {'Tunai': true}).get('Tunai', true) is bool
+        && request.resource.data.get('paymentMethods', {}).get('QRIS', true) is bool;
+
+      match /products/{id} {
+        allow read: if owner(uid);
+        allow create, update: if owner(uid)
+          && request.resource.data.keys().hasOnly(['name', 'price', 'cost', 'stock', 'minimumStock', 'category', 'active', 'favorite', 'sold', 'photoUrl', 'updatedAt'])
+          && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 200
+          && request.resource.data.price is int && request.resource.data.price > 0
+          && nonnegative(request.resource.data.cost) && nonnegative(request.resource.data.stock)
+          && nonnegative(request.resource.data.minimumStock) && nonnegative(request.resource.data.sold)
+          && request.resource.data.category is string && request.resource.data.active is bool
+          && request.resource.data.favorite is bool
+          && (request.resource.data.photoUrl == null || request.resource.data.photoUrl is string)
+          && request.resource.data.updatedAt == request.time;
+      }
+      match /transactions/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid)
+          && request.resource.data.keys().hasOnly(['date', 'method', 'items', 'discount', 'points', 'total', 'cash'])
+          && request.resource.data.method in ['Tunai', 'QRIS']
+          && request.resource.data.date == request.time
+          && request.resource.data.items is list && request.resource.data.items.size() > 0 && request.resource.data.items.size() <= 100
+          && request.resource.data.discount == 0 && request.resource.data.points == 0
+          && request.resource.data.total is int && request.resource.data.total > 0
+          && request.resource.data.cash is int
+          && ((request.resource.data.method == 'Tunai' && request.resource.data.cash >= request.resource.data.total)
+            || (request.resource.data.method == 'QRIS' && request.resource.data.cash == 0));
+        // Receipts are immutable. Only a trusted backend may amend them.
+        allow update, delete: if false;
+      }
+      match /stockMovements/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid)
+          && request.resource.data.keys().hasOnly(['productId', 'quantity', 'date'])
+          && request.resource.data.productId is string
+          && request.resource.data.quantity is int && request.resource.data.quantity > 0
+          && request.resource.data.date == request.time;
+      }
+      match /shifts/{id} {
+        function statePath() {
+          return /databases/$(database)/documents/users/$(uid)/shiftState/current;
+        }
+        allow read: if owner(uid);
+        allow create: if owner(uid)
+          && request.resource.data.keys().hasOnly(['cashier', 'openingCash', 'startedAt', 'endedAt', 'countedCash', 'note'])
+          && request.resource.data.cashier is string
+          && request.resource.data.cashier.size() > 0 && request.resource.data.cashier.size() <= 100
+          && nonnegative(request.resource.data.openingCash)
+          && request.resource.data.startedAt == request.time
+          && request.resource.data.endedAt == null
+          && request.resource.data.countedCash == null && request.resource.data.note == ''
+          && (!exists(statePath()) || get(statePath()).data.activeShiftId == null)
+          && getAfter(statePath()).data.activeShiftId == id;
+        allow update: if owner(uid)
+          && resource.data.endedAt == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['endedAt', 'countedCash', 'note'])
+          && request.resource.data.endedAt == request.time
+          && request.resource.data.endedAt >= resource.data.startedAt
+          && nonnegative(request.resource.data.countedCash)
+          && request.resource.data.note is string && request.resource.data.note.size() <= 1000
+          && get(statePath()).data.activeShiftId == id
+          && getAfter(statePath()).data.activeShiftId == null;
+        allow delete: if false;
+      }
+      match /shiftState/{id} {
+        function shiftPath(shiftId) {
+          return /databases/$(database)/documents/users/$(uid)/shifts/$(shiftId);
+        }
+        function starting() {
+          let next = request.resource.data.activeShiftId;
+          return next is string && next.size() > 0
+            && !exists(shiftPath(next))
+            && getAfter(shiftPath(next)).data.startedAt == request.time
+            && getAfter(shiftPath(next)).data.endedAt == null;
+        }
+        allow read: if owner(uid);
+        allow create: if owner(uid) && id == 'current'
+          && request.resource.data.keys().hasOnly(['activeShiftId']) && starting();
+        allow update: if owner(uid) && id == 'current'
+          && request.resource.data.keys().hasOnly(['activeShiftId'])
+          && ((resource.data.activeShiftId == null && starting())
+            || (resource.data.activeShiftId is string
+              && request.resource.data.activeShiftId == null
+              && getAfter(shiftPath(resource.data.activeShiftId)).data.endedAt == request.time));
+        allow delete: if false;
+      }
+      match /subscription/{id} {
+        allow read: if owner(uid);
+        // Demo mode: each owner can activate 30 days, then renew after expiry.
+        function validDemo() {
+          return id == 'current'
+            && request.resource.data.keys().hasOnly(['source', 'status', 'startedAt', 'periodDays'])
+            && request.resource.data.source == 'demo'
+            && request.resource.data.status == 'active'
+            && request.resource.data.startedAt == request.time
+            && request.resource.data.periodDays == 30;
+        }
+        function expired() {
+          return resource.data.get('source', '') == 'demo'
+            ? resource.data.startedAt + duration.value(30, 'd') <= request.time
+            : resource.data.get('expiresAt', request.time) <= request.time;
+        }
+        allow create: if owner(uid) && validDemo();
+        allow update: if owner(uid) && validDemo() && expired();
+        allow delete: if false;
+      }
+      match /devices/{token} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid)
+          && request.resource.data.keys().hasOnly(['token', 'updatedAt'])
+          && request.resource.data.token == token && request.resource.data.updatedAt == request.time;
+      }
+      match /supportTickets/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid)
+          && request.resource.data.keys().hasOnly(['message', 'status', 'createdAt'])
+          && request.resource.data.message is string
+          && request.resource.data.message.size() > 0 && request.resource.data.message.size() <= 2000
+          && request.resource.data.status == 'open' && request.resource.data.createdAt == request.time;
+      }
+    }
+    match /configuration/legal {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}
